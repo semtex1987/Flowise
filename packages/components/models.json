@@ -992,6 +992,11 @@
                     "description": "Powerful generalist embedding model"
                 },
                 {
+                    "label": "voyage-law-2",
+                    "name": "voyage-law-2",
+                    "description": "Optimized for legal and long-context retrieval and RAG. Also improved performance across all domains."
+                },
+                {
                     "label": "voyage-lite-02-instruct",
                     "name": "voyage-lite-02-instruct",
                     "description": "Instruction-tuned for classification, clustering, and sentence textual similarity tasks"
