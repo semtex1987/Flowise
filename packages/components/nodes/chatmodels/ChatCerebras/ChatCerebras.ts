@@ -1,8 +1,8 @@
-import { ChatOpenAI, OpenAIChatInput } from '@langchain/openai'
+import { ChatOpenAI, ChatOpenAIFields } from '@langchain/openai'
 import { BaseCache } from '@langchain/core/caches'
-import { BaseLLMParams } from '@langchain/core/language_models/llms'
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { ICommonObject, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
+import { getModels, MODEL_TYPE } from '../../../src/modelLoader'
 
 class ChatCerebras_ChatModels implements INode {
     label: string
@@ -17,9 +17,9 @@ class ChatCerebras_ChatModels implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'ChatCerebras'
+        this.label = 'Cerebras'
         this.name = 'chatCerebras'
-        this.version = 2.0
+        this.version = 3.0
         this.type = 'ChatCerebras'
         this.icon = 'cerebras.png'
         this.category = 'Chat Models'
@@ -42,8 +42,9 @@ class ChatCerebras_ChatModels implements INode {
             {
                 label: 'Model Name',
                 name: 'modelName',
-                type: 'string',
-                placeholder: 'llama3.1-8b'
+                type: 'asyncOptions',
+                loadMethod: 'listModels',
+                default: 'llama3.1-8b'
             },
             {
                 label: 'Temperature',
@@ -102,21 +103,29 @@ class ChatCerebras_ChatModels implements INode {
                 additionalParams: true
             },
             {
-                label: 'BasePath',
+                label: 'Base Path',
                 name: 'basepath',
                 type: 'string',
                 optional: true,
                 default: 'https://api.cerebras.ai/v1',
+                description: 'Override the default base URL for the API, e.g., "https://api.example.com/v2/',
                 additionalParams: true
             },
             {
-                label: 'BaseOptions',
+                label: 'Base Options',
                 name: 'baseOptions',
                 type: 'json',
                 optional: true,
+                description: 'Default headers to include with every request to the API.',
                 additionalParams: true
             }
         ]
+    }
+
+    loadMethods = {
+        async listModels(_: INodeData, __?: ICommonObject): Promise<INodeOptionsValue[]> {
+            return await getModels(MODEL_TYPE.CHAT, 'chatCerebras')
+        }
     }
 
     async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
@@ -135,9 +144,10 @@ class ChatCerebras_ChatModels implements INode {
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const cerebrasAIApiKey = getCredentialParam('cerebrasApiKey', credentialData, nodeData)
 
-        const obj: Partial<OpenAIChatInput> & BaseLLMParams & { cerebrasAIApiKey?: string } = {
+        const obj: ChatOpenAIFields = {
             temperature: parseFloat(temperature),
-            modelName,
+            model: modelName,
+            apiKey: cerebrasAIApiKey,
             openAIApiKey: cerebrasAIApiKey,
             streaming: streaming ?? true
         }
@@ -158,10 +168,21 @@ class ChatCerebras_ChatModels implements INode {
                 throw new Error("Invalid JSON in the ChatCerebras's BaseOptions: " + exception)
             }
         }
-        const model = new ChatOpenAI(obj, {
-            basePath,
-            baseOptions: parsedBaseOptions
-        })
+
+        // Add integration tracking header and configure endpoint
+        const integrationHeader = {
+            'X-Cerebras-3rd-Party-Integration': 'flowise'
+        }
+
+        obj.configuration = {
+            baseURL: basePath || 'https://api.cerebras.ai/v1',
+            defaultHeaders: {
+                ...integrationHeader,
+                ...(parsedBaseOptions || {})
+            }
+        }
+
+        const model = new ChatOpenAI(obj)
         return model
     }
 }

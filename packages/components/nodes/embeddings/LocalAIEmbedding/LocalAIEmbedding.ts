@@ -1,4 +1,4 @@
-import { OpenAIEmbeddings, OpenAIEmbeddingsParams } from '@langchain/openai'
+import { ClientOptions, OpenAIEmbeddings, OpenAIEmbeddingsParams } from '@langchain/openai'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 
@@ -15,7 +15,7 @@ class LocalAIEmbedding_Embeddings implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'LocalAI Embeddings'
+        this.label = 'LocalAI Embedding'
         this.name = 'localAIEmbeddings'
         this.version = 1.0
         this.type = 'LocalAI Embeddings'
@@ -53,14 +53,16 @@ class LocalAIEmbedding_Embeddings implements INode {
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const localAIApiKey = getCredentialParam('localAIApiKey', credentialData, nodeData)
 
-        const obj: Partial<OpenAIEmbeddingsParams> & { openAIApiKey?: string } = {
+        const obj: Partial<OpenAIEmbeddingsParams> & { openAIApiKey?: string; configuration?: ClientOptions } = {
             modelName,
             openAIApiKey: 'sk-'
         }
 
         if (localAIApiKey) obj.openAIApiKey = localAIApiKey
 
-        const model = new OpenAIEmbeddings(obj, { basePath })
+        if (basePath) obj.configuration = { baseURL: basePath }
+
+        const model = new OpenAIEmbeddings(obj)
 
         return model
     }

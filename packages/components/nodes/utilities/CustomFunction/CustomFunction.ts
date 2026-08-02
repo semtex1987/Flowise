@@ -1,8 +1,7 @@
 import { flatten } from 'lodash'
 import { type StructuredTool } from '@langchain/core/tools'
-import { NodeVM } from '@flowiseai/nodevm'
 import { DataSource } from 'typeorm'
-import { availableDependencies, defaultAllowBuiltInDep, getVars, handleEscapeCharacters, prepareSandboxVars } from '../../../src/utils'
+import { getVars, handleEscapeCharacters, executeJavaScriptCode, createCodeExecutionSandbox } from '../../../src/utils'
 import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
 
 class CustomFunction_Utilities implements INode {
@@ -83,12 +82,18 @@ class CustomFunction_Utilities implements INode {
         const databaseEntities = options.databaseEntities as IDatabaseEntity
         const tools = Object.fromEntries((flatten(nodeData.inputs?.tools) as StructuredTool[])?.map((tool) => [tool.name, tool]) ?? [])
 
-        const variables = await getVars(appDataSource, databaseEntities, nodeData)
+        const variables = await getVars(appDataSource, databaseEntities, nodeData, options)
         const flow = {
+            input,
             chatflowId: options.chatflowid,
             sessionId: options.sessionId,
             chatId: options.chatId,
-            input
+            rawOutput: options.postProcessing?.rawOutput || '',
+            chatHistory: options.postProcessing?.chatHistory || [],
+            sourceDocuments: options.postProcessing?.sourceDocuments,
+            usedTools: options.postProcessing?.usedTools,
+            artifacts: options.postProcessing?.artifacts,
+            fileAnnotations: options.postProcessing?.fileAnnotations
         }
 
         let inputVars: ICommonObject = {}
@@ -117,35 +122,22 @@ class CustomFunction_Utilities implements INode {
             }
         }
 
-        let sandbox: any = { $input: input }
-        sandbox['$vars'] = prepareSandboxVars(variables)
-        sandbox['$flow'] = flow
-        sandbox['$tools'] = tools
+        // Create additional sandbox variables
+        const additionalSandbox: ICommonObject = {
+            $tools: tools
+        }
 
+        // Add input variables to sandbox
         if (Object.keys(inputVars).length) {
             for (const item in inputVars) {
-                sandbox[`$${item}`] = inputVars[item]
+                additionalSandbox[`$${item}`] = inputVars[item]
             }
         }
 
-        const builtinDeps = process.env.TOOL_FUNCTION_BUILTIN_DEP
-            ? defaultAllowBuiltInDep.concat(process.env.TOOL_FUNCTION_BUILTIN_DEP.split(','))
-            : defaultAllowBuiltInDep
-        const externalDeps = process.env.TOOL_FUNCTION_EXTERNAL_DEP ? process.env.TOOL_FUNCTION_EXTERNAL_DEP.split(',') : []
-        const deps = availableDependencies.concat(externalDeps)
+        const sandbox = createCodeExecutionSandbox(input, variables, flow, additionalSandbox)
 
-        const nodeVMOptions = {
-            console: 'inherit',
-            sandbox,
-            require: {
-                external: { modules: deps },
-                builtin: builtinDeps
-            }
-        } as any
-
-        const vm = new NodeVM(nodeVMOptions)
         try {
-            const response = await vm.run(`module.exports = async function() {${javascriptFunction}}()`, __dirname)
+            const response = await executeJavaScriptCode(javascriptFunction, sandbox)
 
             if (typeof response === 'string' && !isEndingNode) {
                 return handleEscapeCharacters(response, false)

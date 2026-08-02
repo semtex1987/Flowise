@@ -1,5 +1,10 @@
+/*
+* Temporary disabled due to increasing open connections without releasing them
+* Use TypeORM instead
+
 import { VectorStoreDriver } from './Base'
 import { FLOWISE_CHATID } from '../../../../src'
+import { sanitizeDataSourceOptions } from '../../../../src/sanitizeDataSourceOptions'
 import { DistanceStrategy, PGVectorStore, PGVectorStoreArgs } from '@langchain/community/vectorstores/pgvector'
 import { Document } from '@langchain/core/documents'
 import { PoolConfig } from 'pg'
@@ -23,6 +28,7 @@ export class PGVectorDriver extends VectorStoreDriver {
                 } catch (exception) {
                     throw new Error('Invalid JSON in the Additional Configuration: ' + exception)
                 }
+                additionalConfiguration = sanitizeDataSourceOptions(additionalConfiguration)
             }
 
             this._postgresConnectionOptions = {
@@ -120,3 +126,4 @@ export class PGVectorDriver extends VectorStoreDriver {
         return instance
     }
 }
+*/

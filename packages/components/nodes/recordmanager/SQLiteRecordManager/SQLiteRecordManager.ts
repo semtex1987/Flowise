@@ -3,6 +3,9 @@ import { getBaseClasses, getUserHome } from '../../../src/utils'
 import { ListKeyOptions, RecordManagerInterface, UpdateOptions } from '@langchain/community/indexes/base'
 import { DataSource } from 'typeorm'
 import path from 'path'
+import { mergeDataSourceOptions, sanitizeDataSourceOptions } from '../../../src/sanitizeDataSourceOptions'
+import { sanitizeRecordManagerNamespace, sanitizeRecordManagerTableName } from '../../../src/recordManagerSecurity'
+import { validateSQLitePath } from '../../../src/validator'
 
 class SQLiteRecordManager_RecordManager implements INode {
     label: string
@@ -36,6 +39,8 @@ class SQLiteRecordManager_RecordManager implements INode {
                 label: 'Additional Connection Configuration',
                 name: 'additionalConfig',
                 type: 'json',
+                description:
+                    'Optional TypeORM connection options (e.g. ssl, connectTimeout). entities, subscribers, migrations, and extra are not allowed.',
                 additionalParams: true,
                 optional: true
             },
@@ -51,7 +56,6 @@ class SQLiteRecordManager_RecordManager implements INode {
                 label: 'Namespace',
                 name: 'namespace',
                 type: 'string',
-                description: 'If not specified, chatflowid will be used',
                 additionalParams: true,
                 optional: true
             },
@@ -99,10 +103,10 @@ class SQLiteRecordManager_RecordManager implements INode {
 
     async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
         const _tableName = nodeData.inputs?.tableName as string
-        const tableName = _tableName ? _tableName : 'upsertion_records'
+        const tableName = sanitizeRecordManagerTableName(_tableName ? _tableName : 'upsertion_records')
         const additionalConfig = nodeData.inputs?.additionalConfig as string
         const _namespace = nodeData.inputs?.namespace as string
-        const namespace = _namespace ? _namespace : options.chatflowid
+        const namespace = _namespace ? sanitizeRecordManagerNamespace(_namespace) : options.chatflowid
         const cleanup = nodeData.inputs?.cleanup as string
         const _sourceIdKey = nodeData.inputs?.sourceIdKey as string
         const sourceIdKey = _sourceIdKey ? _sourceIdKey : 'source'
@@ -114,15 +118,18 @@ class SQLiteRecordManager_RecordManager implements INode {
             } catch (exception) {
                 throw new Error('Invalid JSON in the Additional Configuration: ' + exception)
             }
+            additionalConfiguration = sanitizeDataSourceOptions(additionalConfiguration)
         }
 
-        const database = path.join(process.env.DATABASE_PATH ?? path.join(getUserHome(), '.flowise'), 'database.sqlite')
+        const database = validateSQLitePath(path.join(process.env.DATABASE_PATH ?? path.join(getUserHome(), '.flowise'), 'database.sqlite'))
 
-        const sqliteOptions = {
-            database,
-            ...additionalConfiguration,
-            type: 'sqlite'
-        }
+        const sqliteOptions = mergeDataSourceOptions(
+            {
+                database,
+                type: 'sqlite'
+            },
+            additionalConfiguration
+        )
 
         const args = {
             sqliteOptions,
@@ -156,6 +163,10 @@ class SQLiteRecordManager implements RecordManagerInterface {
         this.config = config
     }
 
+    sanitizeTableName(tableName: string): string {
+        return sanitizeRecordManagerTableName(tableName)
+    }
+
     private async getDataSource(): Promise<DataSource> {
         const { sqliteOptions } = this.config
         if (!sqliteOptions) {
@@ -167,12 +178,13 @@ class SQLiteRecordManager implements RecordManagerInterface {
     }
 
     async createSchema(): Promise<void> {
+        const dataSource = await this.getDataSource()
         try {
-            const dataSource = await this.getDataSource()
             const queryRunner = dataSource.createQueryRunner()
+            const tableName = this.sanitizeTableName(this.tableName)
 
             await queryRunner.manager.query(`
-CREATE TABLE IF NOT EXISTS "${this.tableName}" (
+CREATE TABLE IF NOT EXISTS "${tableName}" (
   uuid TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   key TEXT NOT NULL,
   namespace TEXT NOT NULL,
@@ -180,10 +192,19 @@ CREATE TABLE IF NOT EXISTS "${this.tableName}" (
   group_id TEXT,
   UNIQUE (key, namespace)
 );
-CREATE INDEX IF NOT EXISTS updated_at_index ON "${this.tableName}" (updated_at);
-CREATE INDEX IF NOT EXISTS key_index ON "${this.tableName}" (key);
-CREATE INDEX IF NOT EXISTS namespace_index ON "${this.tableName}" (namespace);
-CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
+CREATE INDEX IF NOT EXISTS updated_at_index ON "${tableName}" (updated_at);
+CREATE INDEX IF NOT EXISTS key_index ON "${tableName}" (key);
+CREATE INDEX IF NOT EXISTS namespace_index ON "${tableName}" (namespace);
+CREATE INDEX IF NOT EXISTS group_id_index ON "${tableName}" (group_id);`)
+
+            // Add doc_id column if it doesn't exist (migration for existing tables)
+            const checkColumn = await queryRunner.manager.query(
+                `SELECT COUNT(*) as count FROM pragma_table_info('${tableName}') WHERE name='doc_id';`
+            )
+            if (checkColumn[0].count === 0) {
+                await queryRunner.manager.query(`ALTER TABLE "${tableName}" ADD COLUMN doc_id TEXT;`)
+                await queryRunner.manager.query(`CREATE INDEX IF NOT EXISTS doc_id_index ON "${tableName}" (doc_id);`)
+            }
 
             await queryRunner.release()
         } catch (e: any) {
@@ -195,6 +216,8 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
                 return
             }
             throw e
+        } finally {
+            await dataSource.destroy()
         }
     }
 
@@ -213,12 +236,13 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
         }
     }
 
-    async update(keys: string[], updateOptions?: UpdateOptions): Promise<void> {
+    async update(keys: Array<{ uid: string; docId: string }> | string[], updateOptions?: UpdateOptions): Promise<void> {
         if (keys.length === 0) {
             return
         }
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const updatedAt = await this.getTime()
         const { timeAtLeast, groupIds: _groupIds } = updateOptions ?? {}
@@ -227,23 +251,23 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
             throw new Error(`Time sync issue with database ${updatedAt} < ${timeAtLeast}`)
         }
 
-        const groupIds = _groupIds ?? keys.map(() => null)
+        // Handle both new format (objects with uid and docId) and old format (strings)
+        const isNewFormat = keys.length > 0 && typeof keys[0] === 'object' && 'uid' in keys[0]
+        const keyStrings = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.uid) : (keys as string[])
+        const docIds = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.docId) : keys.map(() => null)
 
-        if (groupIds.length !== keys.length) {
-            throw new Error(`Number of keys (${keys.length}) does not match number of group_ids (${groupIds.length})`)
+        const groupIds = _groupIds ?? keyStrings.map(() => null)
+
+        if (groupIds.length !== keyStrings.length) {
+            throw new Error(`Number of keys (${keyStrings.length}) does not match number of group_ids (${groupIds.length})`)
         }
 
-        const recordsToUpsert = keys.map((key, i) => [
-            key,
-            this.namespace,
-            updatedAt,
-            groupIds[i] ?? null // Ensure groupIds[i] is null if undefined
-        ])
+        const recordsToUpsert = keyStrings.map((key, i) => [key, this.namespace, updatedAt, groupIds[i] ?? null, docIds[i] ?? null])
 
         const query = `
-        INSERT INTO "${this.tableName}" (key, namespace, updated_at, group_id)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT (key, namespace) DO UPDATE SET updated_at = excluded.updated_at`
+        INSERT INTO "${tableName}" (key, namespace, updated_at, group_id, doc_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (key, namespace) DO UPDATE SET updated_at = excluded.updated_at, doc_id = excluded.doc_id`
 
         try {
             // To handle multiple files upsert
@@ -264,12 +288,13 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
         if (keys.length === 0) {
             return []
         }
+        const tableName = this.sanitizeTableName(this.tableName)
 
         // Prepare the placeholders and the query
         const placeholders = keys.map(() => `?`).join(', ')
         const sql = `
     SELECT key
-    FROM "${this.tableName}"
+    FROM "${tableName}"
     WHERE namespace = ? AND key IN (${placeholders})`
 
         // Initialize an array to fill with the existence checks
@@ -297,9 +322,11 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
         }
     }
 
-    async listKeys(options?: ListKeyOptions): Promise<string[]> {
-        const { before, after, limit, groupIds } = options ?? {}
-        let query = `SELECT key FROM "${this.tableName}" WHERE namespace = ?`
+    async listKeys(options?: ListKeyOptions & { docId?: string }): Promise<string[]> {
+        const { before, after, limit, groupIds, docId } = options ?? {}
+        const tableName = this.sanitizeTableName(this.tableName)
+
+        let query = `SELECT key FROM "${tableName}" WHERE namespace = ?`
         const values: (string | number | string[])[] = [this.namespace]
 
         if (before) {
@@ -323,6 +350,11 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
                 .map(() => '?')
                 .join(', ')})`
             values.push(...groupIds.filter((gid): gid is string => gid !== null))
+        }
+
+        if (docId) {
+            query += ` AND doc_id = ?`
+            values.push(docId)
         }
 
         query += ';'
@@ -350,9 +382,10 @@ CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const placeholders = keys.map(() => '?').join(', ')
-        const query = `DELETE FROM "${this.tableName}" WHERE namespace = ? AND key IN (${placeholders});`
+        const query = `DELETE FROM "${tableName}" WHERE namespace = ? AND key IN (${placeholders});`
         const values = [this.namespace, ...keys].map((v) => (typeof v !== 'string' ? `${v}` : v))
 
         // Directly using try/catch with async/await for cleaner flow

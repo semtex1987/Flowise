@@ -3,8 +3,8 @@ import { Callbacks } from '@langchain/core/callbacks/manager'
 import { BaseLanguageModel } from '@langchain/core/language_models/base'
 import { VectorStoreRetriever } from '@langchain/core/vectorstores'
 import { ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate } from '@langchain/core/prompts'
-import { LLMChain } from 'langchain/chains'
-import { BaseDocumentCompressor } from 'langchain/retrievers/document_compressors'
+import { LLMChain } from '@langchain/classic/chains'
+import { BaseDocumentCompressor } from '@langchain/classic/retrievers/document_compressors'
 
 export class ReciprocalRankFusion extends BaseDocumentCompressor {
     private readonly llm: BaseLanguageModel
@@ -50,7 +50,7 @@ export class ReciprocalRankFusion extends BaseDocumentCompressor {
         })
         const docList: Document<Record<string, any>>[][] = []
         for (let i = 0; i < queries.length; i++) {
-            const resultOne = await this.baseRetriever.vectorStore.similaritySearch(queries[i], 5)
+            const resultOne = await this.baseRetriever.vectorStore.similaritySearch(queries[i], 5, this.baseRetriever.filter)
             const docs: any[] = []
             resultOne.forEach((doc) => {
                 docs.push(doc)

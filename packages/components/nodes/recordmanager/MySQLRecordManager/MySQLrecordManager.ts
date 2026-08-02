@@ -1,5 +1,6 @@
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
+import { sanitizeDataSourceOptions } from '../../../src/sanitizeDataSourceOptions'
 import { ListKeyOptions, RecordManagerInterface, UpdateOptions } from '@langchain/community/indexes/base'
 import { DataSource } from 'typeorm'
 
@@ -47,6 +48,8 @@ class MySQLRecordManager_RecordManager implements INode {
                 label: 'Additional Connection Configuration',
                 name: 'additionalConfig',
                 type: 'json',
+                description:
+                    'Optional TypeORM connection options (e.g. ssl, connectTimeout). entities, subscribers, migrations, and extra are not allowed.',
                 additionalParams: true,
                 optional: true
             },
@@ -62,7 +65,6 @@ class MySQLRecordManager_RecordManager implements INode {
                 label: 'Namespace',
                 name: 'namespace',
                 type: 'string',
-                description: 'If not specified, chatflowid will be used',
                 additionalParams: true,
                 optional: true
             },
@@ -134,6 +136,7 @@ class MySQLRecordManager_RecordManager implements INode {
             } catch (exception) {
                 throw new Error('Invalid JSON in the Additional Configuration: ' + exception)
             }
+            additionalConfiguration = sanitizeDataSourceOptions(additionalConfiguration)
         }
 
         const mysqlOptions = {
@@ -178,6 +181,18 @@ class MySQLRecordManager implements RecordManagerInterface {
         this.config = config
     }
 
+    sanitizeTableName(tableName: string): string {
+        // Trim and normalize case, turn whitespace into underscores
+        tableName = tableName.trim().toLowerCase().replace(/\s+/g, '_')
+
+        // Validate using a regex (alphanumeric and underscores only)
+        if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+            throw new Error('Invalid table name')
+        }
+
+        return tableName
+    }
+
     private async getDataSource(): Promise<DataSource> {
         const { mysqlOptions } = this.config
         if (!mysqlOptions) {
@@ -193,11 +208,12 @@ class MySQLRecordManager implements RecordManagerInterface {
     }
 
     async createSchema(): Promise<void> {
+        const dataSource = await this.getDataSource()
         try {
-            const dataSource = await this.getDataSource()
             const queryRunner = dataSource.createQueryRunner()
+            const tableName = this.sanitizeTableName(this.tableName)
 
-            await queryRunner.manager.query(`create table if not exists \`${this.tableName}\` (
+            await queryRunner.manager.query(`create table if not exists \`${this.sanitizeTableName(tableName)}\` (
                 \`uuid\` varchar(36) primary key default (UUID()),
                 \`key\` varchar(255) not null,
                 \`namespace\` varchar(255) not null,
@@ -206,16 +222,42 @@ class MySQLRecordManager implements RecordManagerInterface {
                 unique key \`unique_key_namespace\` (\`key\`,
 \`namespace\`));`)
 
-            const columns = [`updated_at`, `key`, `namespace`, `group_id`]
+            // Add doc_id column if it doesn't exist (migration for existing tables)
+            const checkColumn = await queryRunner.manager.query(
+                `SELECT COUNT(1) ColumnExists FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE table_schema=DATABASE() AND table_name='${tableName}' AND column_name='doc_id';`
+            )
+            if (Number(checkColumn[0].ColumnExists) === 0) {
+                await queryRunner.manager.query(`ALTER TABLE \`${tableName}\` ADD COLUMN \`doc_id\` longtext;`)
+            }
+
+            const columns = [`updated_at`, `key`, `namespace`, `group_id`, `doc_id`]
             for (const column of columns) {
                 // MySQL does not support 'IF NOT EXISTS' function for Index
                 const Check = await queryRunner.manager.query(
                     `SELECT COUNT(1) IndexIsThere FROM INFORMATION_SCHEMA.STATISTICS 
-                        WHERE table_schema=DATABASE() AND table_name='${this.tableName}' AND index_name='${column}_index';`
+                        WHERE table_schema=DATABASE() AND table_name='${tableName}' AND index_name='${column}_index';`
                 )
-                if (Check[0].IndexIsThere === 0)
-                    await queryRunner.manager.query(`CREATE INDEX \`${column}_index\`
-        ON \`${this.tableName}\` (\`${column}\`);`)
+
+                if (Number(Check[0].IndexIsThere) === 0) {
+                    // Check column data type to determine if prefix length is needed
+                    const columnTypeCheck = await queryRunner.manager.query(
+                        `SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS 
+                            WHERE table_schema=DATABASE() AND table_name='${tableName}' AND column_name='${column}';`
+                    )
+
+                    // For TEXT/BLOB columns, use prefix length of 255
+                    if (columnTypeCheck.length > 0) {
+                        const dataType = columnTypeCheck[0].DATA_TYPE.toLowerCase()
+                        if (dataType.includes('text') || dataType.includes('blob')) {
+                            await queryRunner.manager.query(`CREATE INDEX \`${column}_index\`
+        ON \`${tableName}\` (\`${column}\`(255));`)
+                        } else {
+                            await queryRunner.manager.query(`CREATE INDEX \`${column}_index\`
+        ON \`${tableName}\` (\`${column}\`);`)
+                        }
+                    }
+                }
             }
 
             await queryRunner.release()
@@ -228,6 +270,8 @@ class MySQLRecordManager implements RecordManagerInterface {
                 return
             }
             throw e
+        } finally {
+            await dataSource.destroy()
         }
     }
 
@@ -246,13 +290,14 @@ class MySQLRecordManager implements RecordManagerInterface {
         }
     }
 
-    async update(keys: string[], updateOptions?: UpdateOptions): Promise<void> {
+    async update(keys: Array<{ uid: string; docId: string }> | string[], updateOptions?: UpdateOptions): Promise<void> {
         if (keys.length === 0) {
             return
         }
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const updatedAt = await this.getTime()
         const { timeAtLeast, groupIds: _groupIds } = updateOptions ?? {}
@@ -261,23 +306,23 @@ class MySQLRecordManager implements RecordManagerInterface {
             throw new Error(`Time sync issue with database ${updatedAt} < ${timeAtLeast}`)
         }
 
-        const groupIds = _groupIds ?? keys.map(() => null)
+        // Handle both new format (objects with uid and docId) and old format (strings)
+        const isNewFormat = keys.length > 0 && typeof keys[0] === 'object' && 'uid' in keys[0]
+        const keyStrings = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.uid) : (keys as string[])
+        const docIds = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.docId) : keys.map(() => null)
 
-        if (groupIds.length !== keys.length) {
-            throw new Error(`Number of keys (${keys.length}) does not match number of group_ids (${groupIds.length})`)
+        const groupIds = _groupIds ?? keyStrings.map(() => null)
+
+        if (groupIds.length !== keyStrings.length) {
+            throw new Error(`Number of keys (${keyStrings.length}) does not match number of group_ids (${groupIds.length})`)
         }
 
-        const recordsToUpsert = keys.map((key, i) => [
-            key,
-            this.namespace,
-            updatedAt,
-            groupIds[i] ?? null // Ensure groupIds[i] is null if undefined
-        ])
+        const recordsToUpsert = keyStrings.map((key, i) => [key, this.namespace, updatedAt, groupIds[i] ?? null, docIds[i] ?? null])
 
         const query = `
-            INSERT INTO \`${this.tableName}\` (\`key\`, \`namespace\`, \`updated_at\`, \`group_id\`)
-            VALUES (?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE \`updated_at\` = VALUES(\`updated_at\`)`
+            INSERT INTO \`${tableName}\` (\`key\`, \`namespace\`, \`updated_at\`, \`group_id\`, \`doc_id\`)
+            VALUES (?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE \`updated_at\` = VALUES(\`updated_at\`), \`doc_id\` = VALUES(\`doc_id\`)`
 
         // To handle multiple files upsert
         try {
@@ -302,12 +347,13 @@ class MySQLRecordManager implements RecordManagerInterface {
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         // Prepare the placeholders and the query
         const placeholders = keys.map(() => `?`).join(', ')
         const query = `
     SELECT \`key\`
-    FROM \`${this.tableName}\`
+    FROM \`${tableName}\`
     WHERE \`namespace\` = ? AND \`key\` IN (${placeholders})`
 
         // Initialize an array to fill with the existence checks
@@ -332,13 +378,14 @@ class MySQLRecordManager implements RecordManagerInterface {
         }
     }
 
-    async listKeys(options?: ListKeyOptions): Promise<string[]> {
+    async listKeys(options?: ListKeyOptions & { docId?: string }): Promise<string[]> {
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         try {
-            const { before, after, limit, groupIds } = options ?? {}
-            let query = `SELECT \`key\` FROM \`${this.tableName}\` WHERE \`namespace\` = ?`
+            const { before, after, limit, groupIds, docId } = options ?? {}
+            let query = `SELECT \`key\` FROM \`${tableName}\` WHERE \`namespace\` = ?`
             const values: (string | number | string[])[] = [this.namespace]
 
             if (before) {
@@ -364,6 +411,11 @@ class MySQLRecordManager implements RecordManagerInterface {
                 values.push(...groupIds.filter((gid): gid is string => gid !== null))
             }
 
+            if (docId) {
+                query += ` AND \`doc_id\` = ?`
+                values.push(docId)
+            }
+
             query += ';'
 
             // Directly using try/catch with async/await for cleaner flow
@@ -385,9 +437,10 @@ class MySQLRecordManager implements RecordManagerInterface {
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const placeholders = keys.map(() => '?').join(', ')
-        const query = `DELETE FROM \`${this.tableName}\` WHERE \`namespace\` = ? AND \`key\` IN (${placeholders});`
+        const query = `DELETE FROM \`${tableName}\` WHERE \`namespace\` = ? AND \`key\` IN (${placeholders});`
         const values = [this.namespace, ...keys].map((v) => (typeof v !== 'string' ? `${v}` : v))
 
         // Directly using try/catch with async/await for cleaner flow

@@ -1,4 +1,5 @@
 import { flatten } from 'lodash'
+import type { BaseLanguageModel } from '@langchain/core/language_models/base'
 import { Tool } from '@langchain/core/tools'
 import { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { AIMessage, BaseMessage, HumanMessage } from '@langchain/core/messages'
@@ -6,22 +7,13 @@ import { ChainValues } from '@langchain/core/utils/types'
 import { AgentStep } from '@langchain/core/agents'
 import { renderTemplate, MessagesPlaceholder, HumanMessagePromptTemplate, PromptTemplate } from '@langchain/core/prompts'
 import { RunnableSequence } from '@langchain/core/runnables'
-import { ChatConversationalAgent } from 'langchain/agents'
-import { getBaseClasses } from '../../../src/utils'
+import { ChatConversationalAgent } from '@langchain/classic/agents'
+import { getBaseClasses, transformBracesWithColon } from '../../../src/utils'
 import { ConsoleCallbackHandler, CustomChainHandler, additionalCallbacks } from '../../../src/handler'
-import {
-    IVisionChatModal,
-    FlowiseMemory,
-    ICommonObject,
-    INode,
-    INodeData,
-    INodeParams,
-    IUsedTool,
-    IServerSideEventStreamer
-} from '../../../src/Interface'
+import { FlowiseMemory, ICommonObject, INode, INodeData, INodeParams, IUsedTool, IServerSideEventStreamer } from '../../../src/Interface'
 import { AgentExecutor } from '../../../src/agents'
 import { addImagesToMessages, llmSupportsVision } from '../../../src/multiModalUtils'
-import { checkInputs, Moderation } from '../../moderation/Moderation'
+import { checkInputs, Moderation, streamResponse } from '../../moderation/Moderation'
 import { formatResponse } from '../../outputparsers/OutputParserHelpers'
 
 const DEFAULT_PREFIX = `Assistant is a large language model trained by OpenAI.
@@ -52,6 +44,8 @@ class ConversationalAgent_Agents implements INode {
     baseClasses: string[]
     inputs: INodeParams[]
     sessionId?: string
+    deprecateMessage: string
+    badge: string
 
     constructor(fields?: { sessionId?: string }) {
         this.label = 'Conversational Agent'
@@ -61,6 +55,9 @@ class ConversationalAgent_Agents implements INode {
         this.category = 'Agents'
         this.icon = 'agent.svg'
         this.description = 'Conversational agent for a chat model. It will utilize chat specific prompts'
+        this.badge = 'DEPRECATING'
+        this.deprecateMessage =
+            'Conversational agent is deprecated and will be removed in a future release. Use Agent from AgentFlow instead.'
         this.baseClasses = [this.type, ...getBaseClasses(AgentExecutor)]
         this.inputs = [
             {
@@ -124,16 +121,15 @@ class ConversationalAgent_Agents implements INode {
                 input = await checkInputs(moderations, input)
             } catch (e) {
                 await new Promise((resolve) => setTimeout(resolve, 500))
-                // if (options.shouldStreamResponse) {
-                //     streamResponse(options.sseStreamer, options.chatId, e.message)
-                // }
-                //streamResponse(options.socketIO && options.socketIOClientId, e.message, options.socketIO, options.socketIOClientId)
+                if (options.shouldStreamResponse) {
+                    streamResponse(sseStreamer, chatId, e.message)
+                }
                 return formatResponse(e.message)
             }
         }
         const executor = await prepareAgent(nodeData, options, { sessionId: this.sessionId, chatId: options.chatId, input })
 
-        const loggerHandler = new ConsoleCallbackHandler(options.logger)
+        const loggerHandler = new ConsoleCallbackHandler(options.logger, options?.orgId)
         const callbacks = await additionalCallbacks(nodeData, options)
 
         let res: ChainValues = {}
@@ -218,7 +214,7 @@ const prepareAgent = async (
     let tools = nodeData.inputs?.tools as Tool[]
     tools = flatten(tools)
     const memory = nodeData.inputs?.memory as FlowiseMemory
-    const systemMessage = nodeData.inputs?.systemMessage as string
+    let systemMessage = nodeData.inputs?.systemMessage as string
     const memoryKey = memory.memoryKey ? memory.memoryKey : 'chat_history'
     const inputKey = memory.inputKey ? memory.inputKey : 'input'
     const prependMessages = options?.prependMessages
@@ -228,18 +224,17 @@ const prepareAgent = async (
         toolNames: tools.map((tool) => tool.name)
     })
 
+    systemMessage = transformBracesWithColon(systemMessage)
+
     const prompt = ChatConversationalAgent.createPrompt(tools, {
         systemMessage: systemMessage ? systemMessage : DEFAULT_PREFIX,
         outputParser
     })
 
     if (llmSupportsVision(model)) {
-        const visionChatModel = model as IVisionChatModal
         const messageContent = await addImagesToMessages(nodeData, options, model.multiModalOption)
 
         if (messageContent?.length) {
-            visionChatModel.setVisionModel()
-
             // Pop the `agent_scratchpad` MessagePlaceHolder
             let messagePlaceholder = prompt.promptMessages.pop() as MessagesPlaceholder
             if (prompt.promptMessages.at(-1) instanceof HumanMessagePromptTemplate) {
@@ -257,13 +252,11 @@ const prepareAgent = async (
 
             // Add the `agent_scratchpad` MessagePlaceHolder back
             prompt.promptMessages.push(messagePlaceholder)
-        } else {
-            visionChatModel.revertToOriginalModel()
         }
     }
 
     /** Bind a stop token to the model */
-    const modelWithStop = model.bind({
+    const modelWithStop = (model as BaseLanguageModel).withConfig({
         stop: ['\nObservation']
     })
 

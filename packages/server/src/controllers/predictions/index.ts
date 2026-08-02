@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express'
-import { getRateLimiter } from '../../utils/rateLimit'
+import { RateLimiterManager } from '../../utils/rateLimit'
 import chatflowsService from '../../services/chatflows'
 import logger from '../../utils/logger'
 import predictionsServices from '../../services/predictions'
@@ -8,6 +8,7 @@ import { StatusCodes } from 'http-status-codes'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
 import { v4 as uuidv4 } from 'uuid'
 import { getErrorMessage } from '../../errors/utils'
+import { MODE } from '../../Interface'
 
 // Send input message and get prediction result (External)
 const createPrediction = async (req: Request, res: Response, next: NextFunction) => {
@@ -24,7 +25,9 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                 `Error: predictionsController.createPrediction - body not provided!`
             )
         }
-        const chatflow = await chatflowsService.getChatflowById(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+
+        const chatflow = await chatflowsService.getChatflowById(req.params.id, workspaceId)
         if (!chatflow) {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Chatflow ${req.params.id} not found`)
         }
@@ -55,11 +58,13 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
             const isStreamingRequested = req.body.streaming === 'true' || req.body.streaming === true
             if (streamable?.isStreaming && isStreamingRequested) {
                 const sseStreamer = getRunningExpressApp().sseStreamer
+
                 let chatId = req.body.chatId
                 if (!req.body.chatId) {
                     chatId = req.body.chatId ?? req.body.overrideConfig?.sessionId ?? uuidv4()
                     req.body.chatId = chatId
                 }
+                const isQueueMode = process.env.MODE === MODE.QUEUE
                 try {
                     sseStreamer.addExternalClient(chatId, res)
                     res.setHeader('Content-Type', 'text/event-stream')
@@ -67,6 +72,10 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                     res.setHeader('Connection', 'keep-alive')
                     res.setHeader('X-Accel-Buffering', 'no') //nginx config: https://serverfault.com/a/801629
                     res.flushHeaders()
+
+                    if (isQueueMode) {
+                        await getRunningExpressApp().redisSubscriber.subscribe(chatId)
+                    }
 
                     const apiResponse = await predictionsServices.buildChatflow(req)
                     sseStreamer.streamMetadataEvent(apiResponse.chatId, apiResponse)
@@ -76,6 +85,9 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                     }
                     next(error)
                 } finally {
+                    if (isQueueMode && chatId) {
+                        await getRunningExpressApp().redisSubscriber.unsubscribe(chatId)
+                    }
                     sseStreamer.removeClient(chatId)
                 }
             } else {
@@ -96,7 +108,7 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
 
 const getRateLimiterMiddleware = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        return getRateLimiter(req, res, next)
+        return RateLimiterManager.getInstance().getRateLimiter()(req, res, next)
     } catch (error) {
         next(error)
     }

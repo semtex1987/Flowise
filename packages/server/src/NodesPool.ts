@@ -26,8 +26,18 @@ export class NodesPool {
     private async initializeNodes() {
         const packagePath = getNodeModulesPackagePath('flowise-components')
         const nodesPath = path.join(packagePath, 'dist', 'nodes')
-        const nodeFiles = await this.getFiles(nodesPath)
-        return Promise.all(
+        const nodes = await this.loadNodesFromDir(nodesPath)
+        Object.assign(this.componentNodes, nodes)
+    }
+
+    /**
+     * Load and filter nodes from a directory.
+     */
+    async loadNodesFromDir(dir: string): Promise<IComponentNodes> {
+        const disabled_nodes = process.env.DISABLED_NODES ? process.env.DISABLED_NODES.split(',') : []
+        const nodes: IComponentNodes = {}
+        const nodeFiles = await this.getFiles(dir)
+        await Promise.all(
             nodeFiles.map(async (file) => {
                 if (file.endsWith('.js')) {
                     try {
@@ -65,8 +75,10 @@ export class NodesPool {
                             let conditionTwo = true
                             if (!isCommunityNodesAllowed && isAuthorPresent) conditionTwo = false
 
-                            if (conditionOne && conditionTwo) {
-                                this.componentNodes[newNodeInstance.name] = newNodeInstance
+                            const isDisabled = disabled_nodes.includes(newNodeInstance.name)
+
+                            if (conditionOne && conditionTwo && !isDisabled) {
+                                nodes[newNodeInstance.name] = newNodeInstance
                             }
                         }
                     } catch (err) {
@@ -75,6 +87,7 @@ export class NodesPool {
                 }
             })
         )
+        return nodes
     }
 
     /**

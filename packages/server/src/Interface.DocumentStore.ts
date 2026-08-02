@@ -1,5 +1,10 @@
 import { ICommonObject } from 'flowise-components'
 import { DocumentStore } from './database/entities/DocumentStore'
+import { DataSource } from 'typeorm'
+import { IComponentNodes } from './Interface'
+import { Telemetry } from './utils/telemetry'
+import { CachePool } from './CachePool'
+import { UsageCacheManager } from './UsageCacheManager'
 
 export enum DocumentStoreStatus {
     EMPTY_SYNC = 'EMPTY',
@@ -23,6 +28,7 @@ export interface IDocumentStore {
     vectorStoreConfig: string | null // JSON string
     embeddingConfig: string | null // JSON string
     recordManagerConfig: string | null // JSON string
+    workspaceId?: string
 }
 
 export interface IDocumentStoreFileChunk {
@@ -43,6 +49,7 @@ export interface IDocumentStoreFileChunkPagedResponse {
     storeName: string
     description: string
     docId: string
+    workspaceId?: string
 }
 
 export interface IDocumentStoreLoader {
@@ -70,6 +77,11 @@ export interface IDocumentStoreLoaderForPreview extends IDocumentStoreLoader {
 
 export interface IDocumentStoreUpsertData {
     docId: string
+    metadata?: string | object
+    replaceExisting?: boolean
+    createNewDocStore?: boolean
+    docStore?: IDocumentStore
+    loaderName?: string
     loader?: {
         name: string
         config: ICommonObject
@@ -110,6 +122,42 @@ export interface IDocumentStoreWhereUsed {
     name: string
 }
 
+export interface IUpsertQueueAppServer {
+    orgId: string
+    workspaceId: string
+    subscriptionId: string
+    appDataSource: DataSource
+    componentNodes: IComponentNodes
+    telemetry: Telemetry
+    usageCacheManager: UsageCacheManager
+    cachePool?: CachePool
+}
+
+export interface IExecuteDocStoreUpsert extends IUpsertQueueAppServer {
+    storeId: string
+    totalItems: IDocumentStoreUpsertData[]
+    files: Express.Multer.File[]
+    isRefreshAPI: boolean
+}
+
+export interface IExecutePreviewLoader extends Omit<IUpsertQueueAppServer, 'telemetry'> {
+    data: IDocumentStoreLoaderForPreview
+    isPreviewOnly: boolean
+    telemetry?: Telemetry
+}
+
+export interface IExecuteProcessLoader extends IUpsertQueueAppServer {
+    data: IDocumentStoreLoaderForPreview
+    docLoaderId: string
+    isProcessWithoutUpsert: boolean
+}
+
+export interface IExecuteVectorStoreInsert extends IUpsertQueueAppServer {
+    data: ICommonObject
+    isStrictSave: boolean
+    isVectorStoreInsert: boolean
+}
+
 const getFileName = (fileBase64: string) => {
     let fileNames = []
     if (fileBase64.startsWith('FILE-STORAGE::')) {
@@ -148,25 +196,26 @@ export const addLoaderSource = (loader: IDocumentStoreLoader, isGetFileNameOnly 
 
     switch (loader.loaderId) {
         case 'pdfFile':
+        case 'docxFile':
         case 'jsonFile':
         case 'csvFile':
         case 'file':
         case 'jsonlinesFile':
         case 'txtFile':
             source = isGetFileNameOnly
-                ? getFileName(loader.loaderConfig[loader.loaderId])
-                : loader.loaderConfig[loader.loaderId]?.replace('FILE-STORAGE::', '') || 'None'
+                ? getFileName(loader.loaderConfig?.[loader.loaderId])
+                : loader.loaderConfig?.[loader.loaderId]?.replace('FILE-STORAGE::', '') || 'None'
             break
         case 'apiLoader':
-            source = loader.loaderConfig.url + ' (' + loader.loaderConfig.method + ')'
+            source = loader.loaderConfig?.url + ' (' + loader.loaderConfig?.method + ')'
             break
         case 'cheerioWebScraper':
         case 'playwrightWebScraper':
         case 'puppeteerWebScraper':
-            source = loader.loaderConfig.url || 'None'
+            source = loader.loaderConfig?.url || 'None'
             break
         case 'unstructuredFileLoader':
-            source = handleUnstructuredFileLoader(loader.loaderConfig, isGetFileNameOnly)
+            source = handleUnstructuredFileLoader(loader.loaderConfig || {}, isGetFileNameOnly)
             break
         default:
             source = 'None'
@@ -190,6 +239,7 @@ export class DocumentStoreDTO {
     totalChunks: number
     totalChars: number
     chunkSize: number
+    workspaceId?: string
     loaders: IDocumentStoreLoader[]
     vectorStoreConfig: any
     embeddingConfig: any
@@ -205,6 +255,7 @@ export class DocumentStoreDTO {
         documentStoreDTO.name = entity.name
         documentStoreDTO.description = entity.description
         documentStoreDTO.status = entity.status
+        documentStoreDTO.workspaceId = entity.workspaceId
         documentStoreDTO.totalChars = 0
         documentStoreDTO.totalChunks = 0
 
@@ -240,14 +291,22 @@ export class DocumentStoreDTO {
     }
 
     static fromEntities(entities: DocumentStore[]): DocumentStoreDTO[] {
+        if (entities.length === 0) {
+            return []
+        }
         return entities.map((entity) => this.fromEntity(entity))
     }
 
     static toEntity(body: any): DocumentStore {
         const docStore = new DocumentStore()
-        Object.assign(docStore, body)
-        docStore.loaders = '[]'
-        docStore.whereUsed = '[]'
+        // Explicit allowlist — never accept id or timestamps from client
+        docStore.name = body.name
+        docStore.description = body.description ?? null
+        docStore.loaders = body.loaders ?? '[]'
+        docStore.whereUsed = body.whereUsed ?? '[]'
+        docStore.vectorStoreConfig = body.vectorStoreConfig ?? null
+        docStore.embeddingConfig = body.embeddingConfig ?? null
+        docStore.recordManagerConfig = body.recordManagerConfig ?? null
         // when a new document store is created, it is empty and in sync
         docStore.status = DocumentStoreStatus.EMPTY_SYNC
         return docStore

@@ -1,8 +1,8 @@
-import { OpenAIChatInput, ChatOpenAI } from '@langchain/openai'
+import { ChatOpenAI, ChatOpenAIFields } from '@langchain/openai'
 import { BaseCache } from '@langchain/core/caches'
-import { BaseLLMParams } from '@langchain/core/language_models/llms'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
+import { checkDenyList } from '../../../src/httpSecurity'
 
 class ChatLocalAI_ChatModels implements INode {
     label: string
@@ -17,7 +17,7 @@ class ChatLocalAI_ChatModels implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'ChatLocalAI'
+        this.label = 'LocalAI'
         this.name = 'chatLocalAI'
         this.version = 3.0
         this.type = 'ChatLocalAI'
@@ -108,10 +108,11 @@ class ChatLocalAI_ChatModels implements INode {
 
         const cache = nodeData.inputs?.cache as BaseCache
 
-        const obj: Partial<OpenAIChatInput> & BaseLLMParams & { openAIApiKey?: string } = {
+        const obj: ChatOpenAIFields = {
             temperature: parseFloat(temperature),
             modelName,
             openAIApiKey: 'sk-',
+            apiKey: 'sk-',
             streaming: streaming ?? true
         }
 
@@ -119,9 +120,16 @@ class ChatLocalAI_ChatModels implements INode {
         if (topP) obj.topP = parseFloat(topP)
         if (timeout) obj.timeout = parseInt(timeout, 10)
         if (cache) obj.cache = cache
-        if (localAIApiKey) obj.openAIApiKey = localAIApiKey
+        if (localAIApiKey) {
+            obj.openAIApiKey = localAIApiKey
+            obj.apiKey = localAIApiKey
+        }
+        if (basePath) {
+            await checkDenyList(basePath)
+            obj.configuration = { baseURL: basePath }
+        }
 
-        const model = new ChatOpenAI(obj, { basePath })
+        const model = new ChatOpenAI(obj)
 
         return model
     }

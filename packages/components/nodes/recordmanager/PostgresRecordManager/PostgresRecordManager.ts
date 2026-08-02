@@ -2,8 +2,10 @@ import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Inter
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
 import { ListKeyOptions, RecordManagerInterface, UpdateOptions } from '@langchain/community/indexes/base'
 import { DataSource } from 'typeorm'
-import { getHost } from '../../vectorstores/Postgres/utils'
+import { getHost, getSSL } from '../../vectorstores/Postgres/utils'
 import { getDatabase, getPort, getTableName } from './utils'
+import { mergeDataSourceOptions, sanitizeDataSourceOptions } from '../../../src/sanitizeDataSourceOptions'
+import { sanitizeRecordManagerNamespace, sanitizeRecordManagerTableName } from '../../../src/recordManagerSecurity'
 
 const serverCredentialsExists = !!process.env.POSTGRES_RECORDMANAGER_USER && !!process.env.POSTGRES_RECORDMANAGER_PASSWORD
 
@@ -52,9 +54,19 @@ class PostgresRecordManager_RecordManager implements INode {
                 optional: true
             },
             {
+                label: 'SSL',
+                name: 'ssl',
+                description: 'Use SSL to connect to Postgres',
+                type: 'boolean',
+                additionalParams: true,
+                optional: true
+            },
+            {
                 label: 'Additional Connection Configuration',
                 name: 'additionalConfig',
                 type: 'json',
+                description:
+                    'Optional TypeORM connection options (e.g. ssl, connectTimeout). entities, subscribers, migrations, and extra are not allowed.',
                 additionalParams: true,
                 optional: true
             },
@@ -70,7 +82,6 @@ class PostgresRecordManager_RecordManager implements INode {
                 label: 'Namespace',
                 name: 'namespace',
                 type: 'string',
-                description: 'If not specified, chatflowid will be used',
                 additionalParams: true,
                 optional: true
             },
@@ -127,10 +138,10 @@ class PostgresRecordManager_RecordManager implements INode {
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const user = getCredentialParam('user', credentialData, nodeData, process.env.POSTGRES_RECORDMANAGER_USER)
         const password = getCredentialParam('password', credentialData, nodeData, process.env.POSTGRES_RECORDMANAGER_PASSWORD)
-        const tableName = getTableName(nodeData)
+        const tableName = sanitizeRecordManagerTableName(getTableName(nodeData))
         const additionalConfig = nodeData.inputs?.additionalConfig as string
         const _namespace = nodeData.inputs?.namespace as string
-        const namespace = _namespace ? _namespace : options.chatflowid
+        const namespace = _namespace ? sanitizeRecordManagerNamespace(_namespace) : options.chatflowid
         const cleanup = nodeData.inputs?.cleanup as string
         const _sourceIdKey = nodeData.inputs?.sourceIdKey as string
         const sourceIdKey = _sourceIdKey ? _sourceIdKey : 'source'
@@ -142,17 +153,21 @@ class PostgresRecordManager_RecordManager implements INode {
             } catch (exception) {
                 throw new Error('Invalid JSON in the Additional Configuration: ' + exception)
             }
+            additionalConfiguration = sanitizeDataSourceOptions(additionalConfiguration)
         }
 
-        const postgresConnectionOptions = {
-            ...additionalConfiguration,
-            type: 'postgres',
-            host: getHost(nodeData),
-            port: getPort(nodeData),
-            username: user,
-            password: password,
-            database: getDatabase(nodeData)
-        }
+        const postgresConnectionOptions = mergeDataSourceOptions(
+            {
+                type: 'postgres',
+                host: getHost(nodeData),
+                port: getPort(nodeData),
+                ssl: getSSL(nodeData),
+                username: user,
+                password: password,
+                database: getDatabase(nodeData)
+            },
+            additionalConfiguration
+        )
 
         const args = {
             postgresConnectionOptions: postgresConnectionOptions,
@@ -186,6 +201,10 @@ class PostgresRecordManager implements RecordManagerInterface {
         this.config = config
     }
 
+    sanitizeTableName(tableName: string): string {
+        return sanitizeRecordManagerTableName(tableName)
+    }
+
     private async getDataSource(): Promise<DataSource> {
         const { postgresConnectionOptions } = this.config
         if (!postgresConnectionOptions) {
@@ -201,12 +220,13 @@ class PostgresRecordManager implements RecordManagerInterface {
     }
 
     async createSchema(): Promise<void> {
+        const dataSource = await this.getDataSource()
         try {
-            const dataSource = await this.getDataSource()
             const queryRunner = dataSource.createQueryRunner()
+            const tableName = this.sanitizeTableName(this.tableName)
 
             await queryRunner.manager.query(`
-  CREATE TABLE IF NOT EXISTS "${this.tableName}" (
+  CREATE TABLE IF NOT EXISTS "${tableName}" (
     uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     key TEXT NOT NULL,
     namespace TEXT NOT NULL,
@@ -214,10 +234,23 @@ class PostgresRecordManager implements RecordManagerInterface {
     group_id TEXT,
     UNIQUE (key, namespace)
   );
-  CREATE INDEX IF NOT EXISTS updated_at_index ON "${this.tableName}" (updated_at);
-  CREATE INDEX IF NOT EXISTS key_index ON "${this.tableName}" (key);
-  CREATE INDEX IF NOT EXISTS namespace_index ON "${this.tableName}" (namespace);
-  CREATE INDEX IF NOT EXISTS group_id_index ON "${this.tableName}" (group_id);`)
+  CREATE INDEX IF NOT EXISTS updated_at_index ON "${tableName}" (updated_at);
+  CREATE INDEX IF NOT EXISTS key_index ON "${tableName}" (key);
+  CREATE INDEX IF NOT EXISTS namespace_index ON "${tableName}" (namespace);
+  CREATE INDEX IF NOT EXISTS group_id_index ON "${tableName}" (group_id);`)
+
+            // Add doc_id column if it doesn't exist (migration for existing tables)
+            await queryRunner.manager.query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns 
+      WHERE table_name = '${tableName}' AND column_name = 'doc_id'
+    ) THEN
+      ALTER TABLE "${tableName}" ADD COLUMN doc_id TEXT;
+      CREATE INDEX IF NOT EXISTS doc_id_index ON "${tableName}" (doc_id);
+    END IF;
+  END $$;`)
 
             await queryRunner.release()
         } catch (e: any) {
@@ -229,6 +262,8 @@ class PostgresRecordManager implements RecordManagerInterface {
                 return
             }
             throw e
+        } finally {
+            await dataSource.destroy()
         }
     }
 
@@ -236,7 +271,7 @@ class PostgresRecordManager implements RecordManagerInterface {
         const dataSource = await this.getDataSource()
         try {
             const queryRunner = dataSource.createQueryRunner()
-            const res = await queryRunner.manager.query('SELECT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)')
+            const res = await queryRunner.manager.query('SELECT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) AS extract')
             await queryRunner.release()
             return Number.parseFloat(res[0].extract)
         } catch (error) {
@@ -262,13 +297,14 @@ class PostgresRecordManager implements RecordManagerInterface {
         return `(${placeholders.join(', ')})`
     }
 
-    async update(keys: string[], updateOptions?: UpdateOptions): Promise<void> {
+    async update(keys: Array<{ uid: string; docId: string }> | string[], updateOptions?: UpdateOptions): Promise<void> {
         if (keys.length === 0) {
             return
         }
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const updatedAt = await this.getTime()
         const { timeAtLeast, groupIds: _groupIds } = updateOptions ?? {}
@@ -277,17 +313,22 @@ class PostgresRecordManager implements RecordManagerInterface {
             throw new Error(`Time sync issue with database ${updatedAt} < ${timeAtLeast}`)
         }
 
-        const groupIds = _groupIds ?? keys.map(() => null)
+        // Handle both new format (objects with uid and docId) and old format (strings)
+        const isNewFormat = keys.length > 0 && typeof keys[0] === 'object' && 'uid' in keys[0]
+        const keyStrings = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.uid) : (keys as string[])
+        const docIds = isNewFormat ? (keys as Array<{ uid: string; docId: string }>).map((k) => k.docId) : keys.map(() => null)
 
-        if (groupIds.length !== keys.length) {
-            throw new Error(`Number of keys (${keys.length}) does not match number of group_ids ${groupIds.length})`)
+        const groupIds = _groupIds ?? keyStrings.map(() => null)
+
+        if (groupIds.length !== keyStrings.length) {
+            throw new Error(`Number of keys (${keyStrings.length}) does not match number of group_ids ${groupIds.length})`)
         }
 
-        const recordsToUpsert = keys.map((key, i) => [key, this.namespace, updatedAt, groupIds[i]])
+        const recordsToUpsert = keyStrings.map((key, i) => [key, this.namespace, updatedAt, groupIds[i], docIds[i]])
 
         const valuesPlaceholders = recordsToUpsert.map((_, j) => this.generatePlaceholderForRowAt(j, recordsToUpsert[0].length)).join(', ')
 
-        const query = `INSERT INTO "${this.tableName}" (key, namespace, updated_at, group_id) VALUES ${valuesPlaceholders} ON CONFLICT (key, namespace) DO UPDATE SET updated_at = EXCLUDED.updated_at;`
+        const query = `INSERT INTO "${tableName}" (key, namespace, updated_at, group_id, doc_id) VALUES ${valuesPlaceholders} ON CONFLICT (key, namespace) DO UPDATE SET updated_at = EXCLUDED.updated_at, doc_id = EXCLUDED.doc_id;`
         try {
             await queryRunner.manager.query(query, recordsToUpsert.flat())
             await queryRunner.release()
@@ -306,12 +347,13 @@ class PostgresRecordManager implements RecordManagerInterface {
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         const startIndex = 2
         const arrayPlaceholders = keys.map((_, i) => `$${i + startIndex}`).join(', ')
 
         const query = `
-        SELECT k, (key is not null) ex from unnest(ARRAY[${arrayPlaceholders}]) k left join "${this.tableName}" on k=key and namespace = $1;
+        SELECT k, (key is not null) ex from unnest(ARRAY[${arrayPlaceholders}]) k left join "${tableName}" on k=key and namespace = $1;
         `
         try {
             const res = await queryRunner.manager.query(query, [this.namespace, ...keys.flat()])
@@ -325,9 +367,11 @@ class PostgresRecordManager implements RecordManagerInterface {
         }
     }
 
-    async listKeys(options?: ListKeyOptions): Promise<string[]> {
-        const { before, after, limit, groupIds } = options ?? {}
-        let query = `SELECT key FROM "${this.tableName}" WHERE namespace = $1`
+    async listKeys(options?: ListKeyOptions & { docId?: string }): Promise<string[]> {
+        const { before, after, limit, groupIds, docId } = options ?? {}
+        const tableName = this.sanitizeTableName(this.tableName)
+
+        let query = `SELECT key FROM "${tableName}" WHERE namespace = $1`
         const values: (string | number | (string | null)[])[] = [this.namespace]
 
         let index = 2
@@ -355,6 +399,12 @@ class PostgresRecordManager implements RecordManagerInterface {
             index += 1
         }
 
+        if (docId) {
+            values.push(docId)
+            query += ` AND doc_id = $${index}`
+            index += 1
+        }
+
         query += ';'
 
         const dataSource = await this.getDataSource()
@@ -379,9 +429,10 @@ class PostgresRecordManager implements RecordManagerInterface {
 
         const dataSource = await this.getDataSource()
         const queryRunner = dataSource.createQueryRunner()
+        const tableName = this.sanitizeTableName(this.tableName)
 
         try {
-            const query = `DELETE FROM "${this.tableName}" WHERE namespace = $1 AND key = ANY($2);`
+            const query = `DELETE FROM "${tableName}" WHERE namespace = $1 AND key = ANY($2);`
             await queryRunner.manager.query(query, [this.namespace, keys])
             await queryRunner.release()
         } catch (error) {

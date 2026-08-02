@@ -1,17 +1,28 @@
-import { Request, Response, NextFunction } from 'express'
+import { NextFunction, Request, Response } from 'express'
+import { StatusCodes } from 'http-status-codes'
+import { InternalFlowiseError } from '../../errors/internalFlowiseError'
+import { getErrorMessage } from '../../errors/utils'
+import { MODE } from '../../Interface'
+import chatflowService from '../../services/chatflows'
 import { utilBuildChatflow } from '../../utils/buildChatflow'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
-import { getErrorMessage } from '../../errors/utils'
 
 // Send input message and get prediction result (Internal)
 const createInternalPrediction = async (req: Request, res: Response, next: NextFunction) => {
     try {
+        const workspaceId = req.user?.activeWorkspaceId
+
+        const chatflow = await chatflowService.getChatflowByIdForWorkspace(req.params.id, workspaceId)
+        if (!chatflow) {
+            throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Chatflow ${req.params.id} not found`)
+        }
+
         if (req.body.streaming || req.body.streaming === 'true') {
             createAndStreamInternalPrediction(req, res, next)
             return
         } else {
             const apiResponse = await utilBuildChatflow(req, true)
-            return res.json(apiResponse)
+            if (apiResponse) return res.json(apiResponse)
         }
     } catch (error) {
         next(error)
@@ -22,6 +33,8 @@ const createInternalPrediction = async (req: Request, res: Response, next: NextF
 const createAndStreamInternalPrediction = async (req: Request, res: Response, next: NextFunction) => {
     const chatId = req.body.chatId
     const sseStreamer = getRunningExpressApp().sseStreamer
+    const isQueueMode = process.env.MODE === MODE.QUEUE
+
     try {
         sseStreamer.addClient(chatId, res)
         res.setHeader('Content-Type', 'text/event-stream')
@@ -29,6 +42,10 @@ const createAndStreamInternalPrediction = async (req: Request, res: Response, ne
         res.setHeader('Connection', 'keep-alive')
         res.setHeader('X-Accel-Buffering', 'no') //nginx config: https://serverfault.com/a/801629
         res.flushHeaders()
+
+        if (isQueueMode) {
+            await getRunningExpressApp().redisSubscriber.subscribe(chatId)
+        }
 
         const apiResponse = await utilBuildChatflow(req, true)
         sseStreamer.streamMetadataEvent(apiResponse.chatId, apiResponse)
@@ -38,6 +55,9 @@ const createAndStreamInternalPrediction = async (req: Request, res: Response, ne
         }
         next(error)
     } finally {
+        if (isQueueMode && chatId) {
+            await getRunningExpressApp().redisSubscriber.unsubscribe(chatId)
+        }
         sseStreamer.removeClient(chatId)
     }
 }

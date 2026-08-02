@@ -4,15 +4,9 @@ import documentStoreService from '../../services/documentstore'
 import { DocumentStore } from '../../database/entities/DocumentStore'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { DocumentStoreDTO } from '../../Interface'
-import { getRateLimiter } from '../../utils/rateLimit'
-
-const getRateLimiterMiddleware = async (req: Request, res: Response, next: NextFunction) => {
-    try {
-        return getRateLimiter(req, res, next)
-    } catch (error) {
-        next(error)
-    }
-}
+import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
+import { FLOWISE_COUNTER_STATUS, FLOWISE_METRIC_COUNTERS } from '../../Interface.Metrics'
+import { getPageAndLimitParams } from '../../utils/pagination'
 
 const createDocumentStore = async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -22,9 +16,26 @@ const createDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.createDocumentStore - body not provided!`
             )
         }
+
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+
         const body = req.body
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
         const docStore = DocumentStoreDTO.toEntity(body)
-        const apiResponse = await documentStoreService.createDocumentStore(docStore)
+        docStore.workspaceId = workspaceId
+        const apiResponse = await documentStoreService.createDocumentStore(docStore, orgId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -33,8 +44,24 @@ const createDocumentStore = async (req: Request, res: Response, next: NextFuncti
 
 const getAllDocumentStores = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const apiResponse = await documentStoreService.getAllDocumentStores()
-        return res.json(DocumentStoreDTO.fromEntities(apiResponse))
+        const { page, limit } = getPageAndLimitParams(req)
+
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.getAllDocumentStores - workspaceId not provided!`
+            )
+        }
+        const apiResponse: any = await documentStoreService.getAllDocumentStores(workspaceId, page, limit)
+        if (apiResponse?.total >= 0) {
+            return res.json({
+                total: apiResponse.total,
+                data: DocumentStoreDTO.fromEntities(apiResponse.data)
+            })
+        } else {
+            return res.json(DocumentStoreDTO.fromEntities(apiResponse))
+        }
     } catch (error) {
         next(error)
     }
@@ -51,7 +78,29 @@ const deleteLoaderFromDocumentStore = async (req: Request, res: Response, next: 
                 `Error: documentStoreController.deleteLoaderFromDocumentStore - missing storeId or loaderId.`
             )
         }
-        const apiResponse = await documentStoreService.deleteLoaderFromDocumentStore(storeId, loaderId)
+
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+
+        const apiResponse = await documentStoreService.deleteLoaderFromDocumentStore(
+            storeId,
+            loaderId,
+            orgId,
+            workspaceId,
+            getRunningExpressApp().usageCacheManager
+        )
         return res.json(DocumentStoreDTO.fromEntity(apiResponse))
     } catch (error) {
         next(error)
@@ -66,9 +115,16 @@ const getDocumentStoreById = async (req: Request, res: Response, next: NextFunct
                 `Error: documentStoreController.getDocumentStoreById - id not provided!`
             )
         }
-        const apiResponse = await documentStoreService.getDocumentStoreById(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.getDocumentStoreById - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.getDocumentStoreById(req.params.id, workspaceId)
         if (apiResponse && apiResponse.whereUsed) {
-            apiResponse.whereUsed = JSON.stringify(await documentStoreService.getUsedChatflowNames(apiResponse))
+            apiResponse.whereUsed = JSON.stringify(await documentStoreService.getUsedChatflowNames(apiResponse, workspaceId))
         }
         return res.json(DocumentStoreDTO.fromEntity(apiResponse))
     } catch (error) {
@@ -90,8 +146,22 @@ const getDocumentStoreFileChunks = async (req: Request, res: Response, next: Nex
                 `Error: documentStoreController.getDocumentStoreFileChunks - fileId not provided!`
             )
         }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.getDocumentStoreFileChunks - workspaceId not provided!`
+            )
+        }
+        const appDataSource = getRunningExpressApp().AppDataSource
         const page = req.params.pageNo ? parseInt(req.params.pageNo) : 1
-        const apiResponse = await documentStoreService.getDocumentStoreFileChunks(req.params.storeId, req.params.fileId, page)
+        const apiResponse = await documentStoreService.getDocumentStoreFileChunks(
+            appDataSource,
+            req.params.storeId,
+            req.params.fileId,
+            workspaceId,
+            page
+        )
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -118,10 +188,18 @@ const deleteDocumentStoreFileChunk = async (req: Request, res: Response, next: N
                 `Error: documentStoreController.deleteDocumentStoreFileChunk - chunkId not provided!`
             )
         }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.deleteDocumentStoreFileChunk - workspaceId not provided!`
+            )
+        }
         const apiResponse = await documentStoreService.deleteDocumentStoreFileChunk(
             req.params.storeId,
             req.params.loaderId,
-            req.params.chunkId
+            req.params.chunkId,
+            workspaceId
         )
         return res.json(apiResponse)
     } catch (error) {
@@ -156,12 +234,20 @@ const editDocumentStoreFileChunk = async (req: Request, res: Response, next: Nex
                 `Error: documentStoreController.editDocumentStoreFileChunk - body not provided!`
             )
         }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.editDocumentStoreFileChunk - workspaceId not provided!`
+            )
+        }
         const apiResponse = await documentStoreService.editDocumentStoreFileChunk(
             req.params.storeId,
             req.params.loaderId,
             req.params.chunkId,
             body.pageContent,
-            body.metadata
+            body.metadata,
+            workspaceId
         )
         return res.json(apiResponse)
     } catch (error) {
@@ -171,6 +257,7 @@ const editDocumentStoreFileChunk = async (req: Request, res: Response, next: Nex
 
 const saveProcessingLoader = async (req: Request, res: Response, next: NextFunction) => {
     try {
+        const appServer = getRunningExpressApp()
         if (typeof req.body === 'undefined') {
             throw new InternalFlowiseError(
                 StatusCodes.PRECONDITION_FAILED,
@@ -178,7 +265,14 @@ const saveProcessingLoader = async (req: Request, res: Response, next: NextFunct
             )
         }
         const body = req.body
-        const apiResponse = await documentStoreService.saveProcessingLoader(body)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.saveProcessingLoader - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.saveProcessingLoader(appServer.AppDataSource, body, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -199,9 +293,33 @@ const processLoader = async (req: Request, res: Response, next: NextFunction) =>
                 `Error: documentStoreController.processLoader - body not provided!`
             )
         }
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const docLoaderId = req.params.loaderId
         const body = req.body
-        const apiResponse = await documentStoreService.processLoader(body, docLoaderId)
+        const isInternalRequest = req.headers['x-request-from'] === 'internal'
+        const apiResponse = await documentStoreService.processLoaderMiddleware(
+            body,
+            docLoaderId,
+            orgId,
+            workspaceId,
+            subscriptionId,
+            getRunningExpressApp().usageCacheManager,
+            isInternalRequest
+        )
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -222,7 +340,14 @@ const updateDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.updateDocumentStore - body not provided!`
             )
         }
-        const store = await documentStoreService.getDocumentStoreById(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.updateDocumentStore - workspaceId not provided!`
+            )
+        }
+        const store = await documentStoreService.getDocumentStoreById(req.params.id, workspaceId)
         if (!store) {
             throw new InternalFlowiseError(
                 StatusCodes.NOT_FOUND,
@@ -231,7 +356,14 @@ const updateDocumentStore = async (req: Request, res: Response, next: NextFuncti
         }
         const body = req.body
         const updateDocStore = new DocumentStore()
-        Object.assign(updateDocStore, body)
+        // Explicit allowlist — id/workspaceId/timestamps must not be overrideable by client
+        if (body.name !== undefined) updateDocStore.name = body.name
+        if (body.description !== undefined) updateDocStore.description = body.description
+        if (body.vectorStoreConfig !== undefined) updateDocStore.vectorStoreConfig = body.vectorStoreConfig
+        if (body.embeddingConfig !== undefined) updateDocStore.embeddingConfig = body.embeddingConfig
+        if (body.recordManagerConfig !== undefined) updateDocStore.recordManagerConfig = body.recordManagerConfig
+        if (body.loaders !== undefined) updateDocStore.loaders = body.loaders
+        if (body.whereUsed !== undefined) updateDocStore.whereUsed = body.whereUsed
         const apiResponse = await documentStoreService.updateDocumentStore(store, updateDocStore)
         return res.json(DocumentStoreDTO.fromEntity(apiResponse))
     } catch (error) {
@@ -247,7 +379,26 @@ const deleteDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.deleteDocumentStore - storeId not provided!`
             )
         }
-        const apiResponse = await documentStoreService.deleteDocumentStore(req.params.id)
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.deleteDocumentStore(
+            req.params.id,
+            orgId,
+            workspaceId,
+            getRunningExpressApp().usageCacheManager
+        )
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -262,9 +413,36 @@ const previewFileChunks = async (req: Request, res: Response, next: NextFunction
                 `Error: documentStoreController.previewFileChunks - body not provided!`
             )
         }
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const body = req.body
+        if (body.storeId) {
+            const store = await documentStoreService.getDocumentStoreById(body.storeId as string, workspaceId)
+            if (!store) {
+                throw new InternalFlowiseError(StatusCodes.NOT_FOUND, 'Document store not found')
+            }
+        }
         body.preview = true
-        const apiResponse = await documentStoreService.previewChunks(body)
+        const apiResponse = await documentStoreService.previewChunksMiddleware(
+            body,
+            orgId,
+            workspaceId,
+            subscriptionId,
+            getRunningExpressApp().usageCacheManager
+        )
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -285,10 +463,39 @@ const insertIntoVectorStore = async (req: Request, res: Response, next: NextFunc
         if (typeof req.body === 'undefined') {
             throw new Error('Error: documentStoreController.insertIntoVectorStore - body not provided!')
         }
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const body = req.body
-        const apiResponse = await documentStoreService.insertIntoVectorStore(body)
+        const isStrictSave = body.isStrictSave ?? false
+        const apiResponse = await documentStoreService.insertIntoVectorStoreMiddleware(
+            body,
+            isStrictSave,
+            orgId,
+            workspaceId,
+            subscriptionId,
+            getRunningExpressApp().usageCacheManager
+        )
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.SUCCESS
+        })
         return res.json(DocumentStoreDTO.fromEntity(apiResponse))
     } catch (error) {
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.FAILURE
+        })
         next(error)
     }
 }
@@ -314,7 +521,18 @@ const deleteVectorStoreFromStore = async (req: Request, res: Response, next: Nex
                 `Error: documentStoreController.deleteVectorStoreFromStore - storeId not provided!`
             )
         }
-        const apiResponse = await documentStoreService.deleteVectorStoreFromStore(req.params.storeId)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.deleteVectorStoreFromStore - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.deleteVectorStoreFromStore(
+            req.params.storeId,
+            workspaceId,
+            (req.query.docId as string) || undefined
+        )
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -327,7 +545,15 @@ const saveVectorStoreConfig = async (req: Request, res: Response, next: NextFunc
             throw new Error('Error: documentStoreController.saveVectorStoreConfig - body not provided!')
         }
         const body = req.body
-        const apiResponse = await documentStoreService.saveVectorStoreConfig(body)
+        const appDataSource = getRunningExpressApp().AppDataSource
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.saveVectorStoreConfig - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.saveVectorStoreConfig(appDataSource, body, true, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -340,7 +566,14 @@ const updateVectorStoreConfigOnly = async (req: Request, res: Response, next: Ne
             throw new Error('Error: documentStoreController.updateVectorStoreConfigOnly - body not provided!')
         }
         const body = req.body
-        const apiResponse = await documentStoreService.updateVectorStoreConfigOnly(body)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.updateVectorStoreConfigOnly - workspaceId not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.updateVectorStoreConfigOnly(body, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -385,11 +618,40 @@ const upsertDocStoreMiddleware = async (req: Request, res: Response, next: NextF
         if (typeof req.body === 'undefined') {
             throw new Error('Error: documentStoreController.upsertDocStoreMiddleware - body not provided!')
         }
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const body = req.body
         const files = (req.files as Express.Multer.File[]) || []
-        const apiResponse = await documentStoreService.upsertDocStoreMiddleware(req.params.id, body, files)
+        const apiResponse = await documentStoreService.upsertDocStoreMiddleware(
+            req.params.id,
+            body,
+            files,
+            orgId,
+            workspaceId,
+            subscriptionId,
+            getRunningExpressApp().usageCacheManager
+        )
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.SUCCESS
+        })
         return res.json(apiResponse)
     } catch (error) {
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.FAILURE
+        })
         next(error)
     }
 }
@@ -402,10 +664,38 @@ const refreshDocStoreMiddleware = async (req: Request, res: Response, next: Next
                 `Error: documentStoreController.refreshDocStoreMiddleware - storeId not provided!`
             )
         }
+        const orgId = req.user?.activeOrganizationId
+        if (!orgId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - organizationId not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
+            )
+        }
+        const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const body = req.body
-        const apiResponse = await documentStoreService.refreshDocStoreMiddleware(req.params.id, body)
+        const apiResponse = await documentStoreService.refreshDocStoreMiddleware(
+            req.params.id,
+            body,
+            orgId,
+            workspaceId,
+            subscriptionId,
+            getRunningExpressApp().usageCacheManager
+        )
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.SUCCESS
+        })
         return res.json(apiResponse)
     } catch (error) {
+        getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
+            status: FLOWISE_COUNTER_STATUS.FAILURE
+        })
         next(error)
     }
 }
@@ -422,6 +712,27 @@ const generateDocStoreToolDesc = async (req: Request, res: Response, next: NextF
             throw new Error('Error: documentStoreController.generateDocStoreToolDesc - body not provided!')
         }
         const apiResponse = await documentStoreService.generateDocStoreToolDesc(req.params.id, req.body.selectedChatModel)
+        return res.json(apiResponse)
+    } catch (error) {
+        next(error)
+    }
+}
+
+const getDocStoreConfigs = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        if (typeof req.params.id === 'undefined' || req.params.id === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.getDocStoreConfigs - storeId not provided!`
+            )
+        }
+        if (typeof req.params.loaderId === 'undefined' || req.params.loaderId === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.getDocStoreConfigs - doc loader Id not provided!`
+            )
+        }
+        const apiResponse = await documentStoreService.findDocStoreAvailableConfigs(req.params.id, req.params.loaderId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -449,9 +760,9 @@ export default {
     queryVectorStore,
     deleteVectorStoreFromStore,
     updateVectorStoreConfigOnly,
-    getRateLimiterMiddleware,
     upsertDocStoreMiddleware,
     refreshDocStoreMiddleware,
     saveProcessingLoader,
-    generateDocStoreToolDesc
+    generateDocStoreToolDesc,
+    getDocStoreConfigs
 }

@@ -2,11 +2,12 @@ import { DataSourceOptions } from 'typeorm/data-source'
 import { DataSource } from 'typeorm'
 import { BaseLanguageModel } from '@langchain/core/language_models/base'
 import { PromptTemplate, PromptTemplateInput } from '@langchain/core/prompts'
-import { SqlDatabaseChain, SqlDatabaseChainInput, DEFAULT_SQL_DATABASE_PROMPT } from 'langchain/chains/sql_db'
-import { SqlDatabase } from 'langchain/sql_db'
+import { SqlDatabaseChain, SqlDatabaseChainInput, DEFAULT_SQL_DATABASE_PROMPT } from '@langchain/classic/chains/sql_db'
+import { SqlDatabase } from '@langchain/classic/sql_db'
 import { ICommonObject, INode, INodeData, INodeParams, IServerSideEventStreamer } from '../../../src/Interface'
 import { ConsoleCallbackHandler, CustomChainHandler, additionalCallbacks } from '../../../src/handler'
-import { getBaseClasses, getInputVariables } from '../../../src/utils'
+import { getBaseClasses, getInputVariables, transformBracesWithColon } from '../../../src/utils'
+import { assertReadOnlySqlStatement, validateSQLitePath } from '../../../src/validator'
 import { checkInputs, Moderation, streamResponse } from '../../moderation/Moderation'
 import { formatResponse } from '../../outputparsers/OutputParserHelpers'
 
@@ -66,7 +67,9 @@ class SqlDatabaseChain_Chains implements INode {
                 label: 'Connection string or file path (sqlite only)',
                 name: 'url',
                 type: 'string',
-                placeholder: '127.0.0.1:5432/chinook'
+                placeholder: '127.0.0.1:5432/chinook',
+                warning:
+                    'This chain executes LLM-generated SQL directly against the database. For SQLite, only point this at a trusted, disposable database file — queries are restricted to read-only SELECT/WITH statements, but the underlying file should not be shared with other sensitive data.'
             },
             {
                 label: 'Include Tables',
@@ -180,7 +183,6 @@ class SqlDatabaseChain_Chains implements INode {
                 if (shouldStreamResponse) {
                     streamResponse(sseStreamer, chatId, e.message)
                 }
-                // streamResponse(options.socketIO && options.socketIOClientId, e.message, options.socketIO, options.socketIOClientId)
                 return formatResponse(e.message)
             }
         }
@@ -195,7 +197,7 @@ class SqlDatabaseChain_Chains implements INode {
             topK,
             customPrompt
         )
-        const loggerHandler = new ConsoleCallbackHandler(options.logger)
+        const loggerHandler = new ConsoleCallbackHandler(options.logger, options?.orgId)
         const callbacks = await additionalCallbacks(nodeData, options)
 
         if (shouldStreamResponse) {
@@ -224,13 +226,24 @@ const getSQLDBChain = async (
         databaseType === 'sqlite'
             ? {
                   type: databaseType,
-                  database: url
+                  database: validateSQLitePath(url)
               }
             : ({
                   type: databaseType,
                   url: url
               } as DataSourceOptions)
     )
+
+    if (databaseType === 'sqlite') {
+        // Restrict every query run against this connection - including langchain's own
+        // schema introspection and the LLM-generated query - to a single read-only
+        // SELECT/WITH statement. See assertReadOnlySqlStatement for why.
+        const originalQuery = datasource.query.bind(datasource)
+        datasource.query = (async (sql: string, parameters?: any[], queryRunner?: any) => {
+            assertReadOnlySqlStatement(sql)
+            return originalQuery(sql, parameters, queryRunner)
+        }) as typeof datasource.query
+    }
 
     const db = await SqlDatabase.fromDataSourceParams({
         appDataSource: datasource,
@@ -247,6 +260,7 @@ const getSQLDBChain = async (
     }
 
     if (customPrompt) {
+        customPrompt = transformBracesWithColon(customPrompt)
         const options: PromptTemplateInput = {
             template: customPrompt,
             inputVariables: getInputVariables(customPrompt)

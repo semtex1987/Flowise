@@ -1,6 +1,6 @@
 import { uniq } from 'lodash'
 import { DataSource } from 'typeorm'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { BaseMessagePromptTemplateLike, ChatPromptTemplate, MessagesPlaceholder } from '@langchain/core/prompts'
 import { RunnableSequence, RunnablePassthrough, RunnableConfig } from '@langchain/core/runnables'
 import { BaseMessage } from '@langchain/core/messages'
@@ -16,18 +16,23 @@ import {
     ISeqAgentNode,
     ISeqAgentsState
 } from '../../../src/Interface'
-import { getInputVariables, getVars, handleEscapeCharacters, prepareSandboxVars } from '../../../src/utils'
 import {
-    ExtractTool,
+    getInputVariables,
+    getVars,
+    handleEscapeCharacters,
+    prepareSandboxVars,
+    transformBracesWithColon,
+    executeJavaScriptCode,
+    createCodeExecutionSandbox
+} from '../../../src/utils'
+import {
     checkCondition,
     convertStructuredSchemaToZod,
     customGet,
-    getVM,
     transformObjectPropertyToFunction,
     filterConversationHistory,
     restructureMessages
 } from '../commonUtils'
-import { ChatGoogleGenerativeAI } from '../../chatmodels/ChatGoogleGenerativeAI/FlowiseChatGoogleGenerativeAI'
 
 interface IConditionGridItem {
     variable: string
@@ -151,7 +156,7 @@ class ConditionAgent_SeqAgents implements INode {
     constructor() {
         this.label = 'Condition Agent'
         this.name = 'seqConditionAgent'
-        this.version = 3.0
+        this.version = 3.1
         this.type = 'ConditionAgent'
         this.icon = 'condition.svg'
         this.category = 'Sequential Agents'
@@ -166,9 +171,11 @@ class ConditionAgent_SeqAgents implements INode {
                 placeholder: 'Condition Agent'
             },
             {
-                label: 'Start | Agent | LLM | Tool Node',
+                label: 'Sequential Node',
                 name: 'sequentialNode',
-                type: 'Start | Agent | LLMNode | ToolNode',
+                type: 'Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow',
+                description:
+                    'Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function, Execute Flow',
                 list: true
             },
             {
@@ -388,7 +395,9 @@ class ConditionAgent_SeqAgents implements INode {
         const output = nodeData.outputs?.output as string
         const sequentialNodes = nodeData.inputs?.sequentialNode as ISeqAgentNode[]
         let agentPrompt = nodeData.inputs?.systemMessagePrompt as string
+        agentPrompt = transformBracesWithColon(agentPrompt)
         let humanPrompt = nodeData.inputs?.humanMessagePrompt as string
+        humanPrompt = transformBracesWithColon(humanPrompt)
         const promptValuesStr = nodeData.inputs?.promptValues
         const conditionAgentStructuredOutput = nodeData.inputs?.conditionAgentStructuredOutput
         const model = nodeData.inputs?.model as BaseChatModel
@@ -481,20 +490,10 @@ const runCondition = async (
         try {
             const structuredOutput = z.object(convertStructuredSchemaToZod(conditionAgentStructuredOutput))
 
-            if (llm instanceof ChatGoogleGenerativeAI) {
-                const tool = new ExtractTool({
-                    schema: structuredOutput
-                })
-                // @ts-ignore
-                const modelWithTool = llm.bind({
-                    tools: [tool],
-                    signal: abortControllerSignal ? abortControllerSignal.signal : undefined
-                })
-                model = modelWithTool
-            } else {
-                // @ts-ignore
-                model = llm.withStructuredOutput(structuredOutput)
-            }
+            // @ts-ignore
+            model = llm.withStructuredOutput(structuredOutput, {
+                method: 'functionCalling'
+            })
         } catch (exception) {
             console.error('Invalid JSON in Condition Agent Structured Output: ' + exception)
             model = llm
@@ -536,7 +535,7 @@ const runCondition = async (
         result = { ...jsonResult, additional_kwargs: { nodeId: nodeData.id } }
     }
 
-    const variables = await getVars(appDataSource, databaseEntities, nodeData)
+    const variables = await getVars(appDataSource, databaseEntities, nodeData, options)
 
     const flow = {
         chatflowId: options.chatflowid,
@@ -549,9 +548,11 @@ const runCondition = async (
     }
 
     if (selectedTab === 'conditionFunction' && conditionFunction) {
-        const vm = await getVM(appDataSource, databaseEntities, nodeData, flow)
+        const sandbox = createCodeExecutionSandbox(input, variables, flow)
+
         try {
-            const response = await vm.run(`module.exports = async function() {${conditionFunction}}()`, __dirname)
+            const response = await executeJavaScriptCode(conditionFunction, sandbox)
+
             if (typeof response !== 'string') throw new Error('Condition function must return a string')
             return response
         } catch (e) {

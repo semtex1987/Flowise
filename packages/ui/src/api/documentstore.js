@@ -1,11 +1,12 @@
 import client from './client'
 
-const getAllDocumentStores = () => client.get('/document-store/store')
+const getAllDocumentStores = (params) => client.get('/document-store/store', { params })
 const getDocumentLoaders = () => client.get('/document-store/components/loaders')
 const getSpecificDocumentStore = (id) => client.get(`/document-store/store/${id}`)
 const createDocumentStore = (body) => client.post(`/document-store/store`, body)
 const updateDocumentStore = (id, body) => client.put(`/document-store/store/${id}`, body)
 const deleteDocumentStore = (id) => client.delete(`/document-store/store/${id}`)
+const getDocumentStoreConfig = (storeId, loaderId) => client.get(`/document-store/store-configs/${storeId}/${loaderId}`)
 
 const deleteLoaderFromStore = (id, fileId) => client.delete(`/document-store/loader/${id}/${fileId}`)
 const deleteChunkFromStore = (storeId, loaderId, chunkId) => client.delete(`/document-store/chunks/${storeId}/${loaderId}/${chunkId}`)
@@ -21,7 +22,10 @@ const refreshLoader = (storeId) => client.post(`/document-store/refresh/${storeI
 const insertIntoVectorStore = (body) => client.post(`/document-store/vectorstore/insert`, body)
 const saveVectorStoreConfig = (body) => client.post(`/document-store/vectorstore/save`, body)
 const updateVectorStoreConfig = (body) => client.post(`/document-store/vectorstore/update`, body)
-const deleteVectorStoreDataFromStore = (storeId) => client.delete(`/document-store/vectorstore/${storeId}`)
+const deleteVectorStoreDataFromStore = (storeId, docId) => {
+    const url = docId ? `/document-store/vectorstore/${storeId}?docId=${docId}` : `/document-store/vectorstore/${storeId}`
+    return client.delete(url)
+}
 const queryVectorStore = (body) => client.post(`/document-store/vectorstore/query`, body)
 const getVectorStoreProviders = () => client.get('/document-store/components/vectorstore')
 const getEmbeddingProviders = () => client.get('/document-store/components/embeddings')
@@ -52,5 +56,6 @@ export default {
     updateVectorStoreConfig,
     saveProcessingLoader,
     refreshLoader,
-    generateDocStoreToolDesc
+    generateDocStoreToolDesc,
+    getDocumentStoreConfig
 }

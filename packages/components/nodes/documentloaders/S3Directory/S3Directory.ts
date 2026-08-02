@@ -1,6 +1,7 @@
-import { omit } from 'lodash'
 import { ICommonObject, INode, INodeData, INodeOptionsValue, INodeOutputsValue, INodeParams } from '../../../src/Interface'
-import { getCredentialData, getCredentialParam, handleEscapeCharacters } from '../../../src/utils'
+import { handleDocumentLoaderDocuments, handleDocumentLoaderMetadata, handleDocumentLoaderOutput } from '../../../src/utils'
+import { getAWSCredentialConfig, AWSCredentials } from '../../../src/awsToolsUtils'
+import { getSafeFilePath } from '../../../src/validator'
 import { S3Client, GetObjectCommand, S3ClientConfig, ListObjectsV2Command, ListObjectsV2Output } from '@aws-sdk/client-s3'
 import { getRegions, MODEL_TYPE } from '../../../src/modelLoader'
 import { Readable } from 'node:stream'
@@ -8,14 +9,15 @@ import * as fsDefault from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
 
-import { DirectoryLoader } from 'langchain/document_loaders/fs/directory'
-import { JSONLoader } from 'langchain/document_loaders/fs/json'
-import { CSVLoader } from '@langchain/community/document_loaders/fs/csv'
+import { DirectoryLoader } from '@langchain/classic/document_loaders/fs/directory'
+import { JSONLoader } from '@langchain/classic/document_loaders/fs/json'
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf'
 import { DocxLoader } from '@langchain/community/document_loaders/fs/docx'
-import { TextLoader } from 'langchain/document_loaders/fs/text'
-import { TextSplitter } from 'langchain/text_splitter'
-
+import { TextLoader } from '@langchain/classic/document_loaders/fs/text'
+import { TextSplitter } from '@langchain/textsplitters'
+import { CSVLoader } from '../Csv/CsvLoader'
+import { LoadOfSheet } from '../MicrosoftExcel/ExcelLoader'
+import { PowerpointLoader } from '../MicrosoftPowerpoint/PowerpointLoader'
 class S3_DocumentLoaders implements INode {
     label: string
     name: string
@@ -151,24 +153,10 @@ class S3_DocumentLoaders implements INode {
         const _omitMetadataKeys = nodeData.inputs?.omitMetadataKeys as string
         const output = nodeData.outputs?.output as string
 
-        let omitMetadataKeys: string[] = []
-        if (_omitMetadataKeys) {
-            omitMetadataKeys = _omitMetadataKeys.split(',').map((key) => key.trim())
-        }
-
-        let credentials: S3ClientConfig['credentials'] | undefined
-
+        let credentials: AWSCredentials | undefined
         if (nodeData.credential) {
-            const credentialData = await getCredentialData(nodeData.credential, options)
-            const accessKeyId = getCredentialParam('awsKey', credentialData, nodeData)
-            const secretAccessKey = getCredentialParam('awsSecret', credentialData, nodeData)
-
-            if (accessKeyId && secretAccessKey) {
-                credentials = {
-                    accessKeyId,
-                    secretAccessKey
-                }
-            }
+            const credentialConfig = await getAWSCredentialConfig(nodeData, options, region)
+            credentials = credentialConfig.credentials
         }
 
         let s3Config: S3ClientConfig = {
@@ -201,7 +189,7 @@ class S3_DocumentLoaders implements INode {
 
             await Promise.all(
                 keys.map(async (key) => {
-                    const filePath = path.join(tempDir, key)
+                    const filePath = getSafeFilePath(tempDir, key)
                     try {
                         const response = await s3Client.send(
                             new GetObjectCommand({
@@ -239,13 +227,19 @@ class S3_DocumentLoaders implements INode {
                     '.json': (path) => new JSONLoader(path),
                     '.txt': (path) => new TextLoader(path),
                     '.csv': (path) => new CSVLoader(path),
+                    '.xls': (path) => new LoadOfSheet(path),
+                    '.xlsx': (path) => new LoadOfSheet(path),
+                    '.xlsm': (path) => new LoadOfSheet(path),
+                    '.xlsb': (path) => new LoadOfSheet(path),
                     '.docx': (path) => new DocxLoader(path),
+                    '.ppt': (path) => new PowerpointLoader(path),
+                    '.pptx': (path) => new PowerpointLoader(path),
                     '.pdf': (path) =>
-                        pdfUsage === 'perFile'
-                            ? // @ts-ignore
-                              new PDFLoader(path, { splitPages: false, pdfjs: () => import('pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js') })
-                            : // @ts-ignore
-                              new PDFLoader(path, { pdfjs: () => import('pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js') }),
+                        new PDFLoader(path, {
+                            splitPages: pdfUsage !== 'perFile',
+                            // @ts-ignore
+                            pdfjs: () => import('pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js')
+                        }),
                     '.aspx': (path) => new TextLoader(path),
                     '.asp': (path) => new TextLoader(path),
                     '.cpp': (path) => new TextLoader(path), // C++
@@ -284,63 +278,16 @@ class S3_DocumentLoaders implements INode {
                 true
             )
 
-            let docs = []
+            let docs = await handleDocumentLoaderDocuments(loader, textSplitter)
 
-            if (textSplitter) {
-                let splittedDocs = await loader.load()
-                splittedDocs = await textSplitter.splitDocuments(splittedDocs)
-                docs.push(...splittedDocs)
-            } else {
-                docs = await loader.load()
-            }
+            docs = handleDocumentLoaderMetadata(docs, _omitMetadataKeys, metadata)
 
-            if (metadata) {
-                const parsedMetadata = typeof metadata === 'object' ? metadata : JSON.parse(metadata)
-                docs = docs.map((doc) => ({
-                    ...doc,
-                    metadata:
-                        _omitMetadataKeys === '*'
-                            ? {
-                                  ...parsedMetadata
-                              }
-                            : omit(
-                                  {
-                                      ...doc.metadata,
-                                      ...parsedMetadata
-                                  },
-                                  omitMetadataKeys
-                              )
-                }))
-            } else {
-                docs = docs.map((doc) => ({
-                    ...doc,
-                    metadata:
-                        _omitMetadataKeys === '*'
-                            ? {}
-                            : omit(
-                                  {
-                                      ...doc.metadata
-                                  },
-                                  omitMetadataKeys
-                              )
-                }))
-            }
-
+            return handleDocumentLoaderOutput(docs, output)
+        } catch (e: any) {
+            throw new Error(`Failed to load data from bucket ${bucketName}: ${e.message}`)
+        } finally {
             // remove the temp directory before returning docs
             fsDefault.rmSync(tempDir, { recursive: true })
-
-            if (output === 'document') {
-                return docs
-            } else {
-                let finaltext = ''
-                for (const doc of docs) {
-                    finaltext += `${doc.pageContent}\n`
-                }
-                return handleEscapeCharacters(finaltext, false)
-            }
-        } catch (e: any) {
-            fsDefault.rmSync(tempDir, { recursive: true })
-            throw new Error(`Failed to load data from bucket ${bucketName}: ${e.message}`)
         }
     }
 }

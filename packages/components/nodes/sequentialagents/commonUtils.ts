@@ -1,7 +1,6 @@
 import { get } from 'lodash'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { DataSource } from 'typeorm'
-import { NodeVM } from '@flowiseai/nodevm'
 import { StructuredTool } from '@langchain/core/tools'
 import { ChatMistralAI } from '@langchain/mistralai'
 import { ChatAnthropic } from '@langchain/anthropic'
@@ -9,15 +8,8 @@ import { Runnable, RunnableConfig, mergeConfigs } from '@langchain/core/runnable
 import { AIMessage, BaseMessage, HumanMessage, MessageContentImageUrl, ToolMessage } from '@langchain/core/messages'
 import { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { addImagesToMessages, llmSupportsVision } from '../../src/multiModalUtils'
-import {
-    ICommonObject,
-    IDatabaseEntity,
-    INodeData,
-    ISeqAgentsState,
-    IVisionChatModal,
-    ConversationHistorySelection
-} from '../../src/Interface'
-import { availableDependencies, defaultAllowBuiltInDep, getVars, prepareSandboxVars } from '../../src/utils'
+import { ICommonObject, IDatabaseEntity, INodeData, ISeqAgentsState, ConversationHistorySelection } from '../../src/Interface'
+import { getVars, executeJavaScriptCode, createCodeExecutionSandbox } from '../../src/utils'
 import { ChatPromptTemplate, BaseMessagePromptTemplateLike } from '@langchain/core/prompts'
 
 export const checkCondition = (input: string | number | undefined, condition: string, value: string | number = ''): boolean => {
@@ -99,7 +91,25 @@ export const transformObjectPropertyToFunction = (obj: ICommonObject, state: ISe
                     (message) => message.additional_kwargs && message.additional_kwargs?.nodeId === parsedValue.id
                 )
                 const messageOutput = messageOutputs[messageOutputs.length - 1]
-                if (messageOutput) value = messageOutput.content
+                if (messageOutput) {
+                    // if messageOutput.content is a string, set value to the content
+                    if (typeof messageOutput.content === 'string') value = messageOutput.content
+                    // if messageOutput.content is an array
+                    else if (Array.isArray(messageOutput.content)) {
+                        if (messageOutput.content.length === 0) {
+                            throw new Error(`Message output content is an empty array for node ${parsedValue.id}`)
+                        }
+                        // Get the first element of the array
+                        const messageOutputContentFirstElement: any = messageOutput.content[0]
+
+                        if (typeof messageOutputContentFirstElement === 'string') value = messageOutputContentFirstElement
+                        // If messageOutputContentFirstElement is an object and has a text property, set value to the text property
+                        else if (typeof messageOutputContentFirstElement === 'object' && messageOutputContentFirstElement.text)
+                            value = messageOutputContentFirstElement.text
+                        // Otherwise, stringify the messageOutputContentFirstElement
+                        else value = JSON.stringify(messageOutputContentFirstElement)
+                    }
+                }
             }
         } catch (e) {
             // do nothing
@@ -119,42 +129,10 @@ export const processImageMessage = async (llm: BaseChatModel, nodeData: INodeDat
     let multiModalMessageContent: MessageContentImageUrl[] = []
 
     if (llmSupportsVision(llm)) {
-        const visionChatModel = llm as IVisionChatModal
         multiModalMessageContent = await addImagesToMessages(nodeData, options, llm.multiModalOption)
-
-        if (multiModalMessageContent?.length) {
-            visionChatModel.setVisionModel()
-        } else {
-            visionChatModel.revertToOriginalModel()
-        }
     }
 
     return multiModalMessageContent
-}
-
-export const getVM = async (appDataSource: DataSource, databaseEntities: IDatabaseEntity, nodeData: INodeData, flow: ICommonObject) => {
-    const variables = await getVars(appDataSource, databaseEntities, nodeData)
-
-    let sandbox: any = {}
-    sandbox['$vars'] = prepareSandboxVars(variables)
-    sandbox['$flow'] = flow
-
-    const builtinDeps = process.env.TOOL_FUNCTION_BUILTIN_DEP
-        ? defaultAllowBuiltInDep.concat(process.env.TOOL_FUNCTION_BUILTIN_DEP.split(','))
-        : defaultAllowBuiltInDep
-    const externalDeps = process.env.TOOL_FUNCTION_EXTERNAL_DEP ? process.env.TOOL_FUNCTION_EXTERNAL_DEP.split(',') : []
-    const deps = availableDependencies.concat(externalDeps)
-
-    const nodeVMOptions = {
-        console: 'inherit',
-        sandbox,
-        require: {
-            external: { modules: deps },
-            builtin: builtinDeps
-        }
-    } as any
-
-    return new NodeVM(nodeVMOptions)
 }
 
 export const customGet = (obj: any, path: string) => {
@@ -246,7 +224,7 @@ export function filterConversationHistory(
 export const restructureMessages = (llm: BaseChatModel, state: ISeqAgentsState) => {
     const messages: BaseMessage[] = []
     for (const message of state.messages as unknown as BaseMessage[]) {
-        // Sometimes Anthropic can return a message with content types of array, ignore that EXECEPT when tool calls are present
+        // Sometimes Anthropic can return a message with content types of array, ignore that EXCEPT when tool calls are present
         if ((message as any).tool_calls?.length && message.content !== '') {
             message.content = JSON.stringify(message.content)
         }
@@ -393,9 +371,19 @@ export const checkMessageHistory = async (
     if (messageHistory) {
         const appDataSource = options.appDataSource as DataSource
         const databaseEntities = options.databaseEntities as IDatabaseEntity
-        const vm = await getVM(appDataSource, databaseEntities, nodeData, {})
+
+        const variables = await getVars(appDataSource, databaseEntities, nodeData, options)
+        const flow = {
+            chatflowId: options.chatflowid,
+            sessionId: options.sessionId,
+            chatId: options.chatId
+        }
+
+        const sandbox = createCodeExecutionSandbox('', variables, flow)
+
         try {
-            const response = await vm.run(`module.exports = async function() {${messageHistory}}()`, __dirname)
+            const response = await executeJavaScriptCode(messageHistory, sandbox)
+
             if (!Array.isArray(response)) throw new Error('Returned message history must be an array')
             if (sysPrompt) {
                 // insert at index 1
